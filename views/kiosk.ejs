@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stripe Terminal Integrador</title>
+  <link rel="stylesheet" href="/public/css/style.css">
+</head>
+<body>
+  <div class="sidebar">
+    <div class="logo">
+      <span class="logo-icon">⚡</span>
+      <span>Stripe Terminal</span>
+    </div>
+    <nav>
+      <a href="/" class="nav-item active">Panel</a>
+      <a href="/monitor" class="nav-item">Monitor</a>
+    </nav>
+    <div class="sidebar-footer">
+      Puerto: <strong><%= port %></strong>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="header">
+      <h1>Panel de Control</h1>
+      <div id="status-badge" class="badge badge-checking">Verificando...</div>
+    </div>
+
+    <!-- Config Stripe Key -->
+    <div class="card">
+      <h2>Configuración</h2>
+      <% if (keyConfigured) { %>
+        <p class="text-success">✅ Stripe Key configurada: <code><%= stripeKey %></code></p>
+      <% } else { %>
+        <p class="text-warn">⚠️ Stripe Key no configurada</p>
+      <% } %>
+      <form id="form-key">
+        <div class="form-row">
+          <input type="text" id="stripe-key" name="key" placeholder="sk_test_..." value="" />
+          <button type="submit" class="btn btn-primary">Guardar Key</button>
+        </div>
+        <small>Usa tu <strong>Secret Key</strong> de Stripe (sk_test_... o sk_live_...)</small>
+      </form>
+      <div id="key-msg" class="msg hidden"></div>
+    </div>
+
+    <!-- Lectores conectados -->
+    <div class="card">
+      <div class="card-header">
+        <h2>Lectores</h2>
+        <button class="btn btn-secondary" onclick="loadReaders()">↻ Refrescar</button>
+      </div>
+      <div id="readers-list">
+        <p class="text-muted">Cargando lectores...</p>
+      </div>
+    </div>
+
+    <!-- Test de pago -->
+    <div class="card">
+      <h2>Prueba de Pago</h2>
+      <div class="form-row">
+        <input type="text" id="test-device" placeholder="Label o serial del lector" />
+        <select id="test-type">
+          <option value="ctl">Contactless (NFC)</option>
+          <option value="chip">Chip</option>
+        </select>
+        <input type="number" id="test-amount" placeholder="Monto (ej: 10.00)" step="0.01" min="0.01" />
+        <button class="btn btn-primary" onclick="testPago()">Pagar</button>
+      </div>
+      <div id="test-result" class="result-box hidden"></div>
+    </div>
+
+    <!-- Endpoints disponibles -->
+    <div class="card">
+      <h2>Endpoints</h2>
+      <table class="endpoints-table">
+        <thead><tr><th>Método</th><th>Ruta</th><th>Descripción</th></tr></thead>
+        <tbody>
+          <tr><td><span class="method get">GET</span></td><td><code>/pago/:device/:type/:amount</code></td><td>Procesar pago en lector</td></tr>
+          <tr><td><span class="method post">POST</span></td><td><code>/connection_token</code></td><td>Token de conexión para lectores</td></tr>
+          <tr><td><span class="method get">GET</span></td><td><code>/list_readers</code></td><td>Listar lectores</td></tr>
+          <tr><td><span class="method get">GET</span></td><td><code>/api/status</code></td><td>Estado del integrador</td></tr>
+          <tr><td><span class="method get">GET</span></td><td><code>/cancelar/:paymentIntentId</code></td><td>Cancelar pago</td></tr>
+          <tr><td><span class="method get">GET</span></td><td><code>/cancelar_lector/:device</code></td><td>Cancelar acción en lector</td></tr>
+          <tr><td><span class="method get">GET</span></td><td><code>/api/logs</code></td><td>Logs recientes (JSON)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function loadReaders() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        const badge = document.getElementById('status-badge');
+        if (data.status === 'success') {
+          badge.className = 'badge badge-ok';
+          badge.textContent = 'Conectado';
+        } else {
+          badge.className = 'badge badge-error';
+          badge.textContent = data.message || 'Error';
+        }
+
+        const list = document.getElementById('readers-list');
+        if (!data.readers || data.readers.length === 0) {
+          list.innerHTML = '<p class="text-muted">No hay lectores registrados en tu cuenta Stripe.</p>';
+          return;
+        }
+
+        list.innerHTML = data.readers.map(r => `
+          <div class="reader-card">
+            <div class="reader-status ${r.status === 'online' ? 'online' : 'offline'}"></div>
+            <div class="reader-info">
+              <strong>${r.label || r.id}</strong>
+              <span>${r.deviceType}</span>
+              <small>Serial: ${r.serial || '—'} | ID: ${r.id}</small>
+            </div>
+            <span class="reader-badge ${r.status}">${r.status}</span>
+          </div>
+        `).join('');
+      } catch (e) {
+        document.getElementById('status-badge').className = 'badge badge-error';
+        document.getElementById('status-badge').textContent = 'Sin conexión';
+      }
+    }
+
+    document.getElementById('form-key').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const key = document.getElementById('stripe-key').value.trim();
+      const msg = document.getElementById('key-msg');
+      try {
+        const res = await fetch('/api/config/key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+        });
+        const data = await res.json();
+        msg.className = 'msg ' + (data.status === 'success' ? 'msg-success' : 'msg-error');
+        msg.textContent = data.message;
+        msg.classList.remove('hidden');
+        if (data.status === 'success') loadReaders();
+      } catch (e) {
+        msg.className = 'msg msg-error';
+        msg.textContent = 'Error al guardar la key';
+        msg.classList.remove('hidden');
+      }
+    });
+
+    async function testPago() {
+      const device = document.getElementById('test-device').value.trim();
+      const type = document.getElementById('test-type').value;
+      const amount = document.getElementById('test-amount').value.trim();
+      const result = document.getElementById('test-result');
+
+      if (!device || !amount) {
+        result.className = 'result-box result-error';
+        result.textContent = 'Completa device y monto';
+        result.classList.remove('hidden');
+        return;
+      }
+
+      result.className = 'result-box result-loading';
+      result.textContent = '⏳ Procesando pago...';
+      result.classList.remove('hidden');
+
+      try {
+        const res = await fetch(`/pago/${encodeURIComponent(device)}/${type}/${amount}`);
+        const data = await res.json();
+        const isOk = data.status === 'success';
+        result.className = 'result-box ' + (isOk ? 'result-success' : 'result-error');
+        result.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+      } catch (e) {
+        result.className = 'result-box result-error';
+        result.textContent = 'Error de red: ' + e.message;
+      }
+    }
+
+    loadReaders();
+    setInterval(loadReaders, 15000);
+  </script>
+</body>
+</html>
