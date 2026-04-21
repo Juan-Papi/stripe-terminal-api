@@ -1,12 +1,59 @@
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const StripeTerminal = require('./library/StripeTerminal');
-const Logger = require('./library/Logger');
+const cors    = require('cors');
+const path    = require('path');
 
-const app = express();
+const StripeTerminal = require('./library/StripeTerminal');
+const Logger         = require('./library/Logger');
+const PaymentStore   = require('./library/PaymentStore');
+
+const app  = express();
 const PORT = process.env.PORT || 8001;
+
+let terminal = null;
+let stripeKey = process.env.STRIPE_SECRET_KEY || '';
+
+function getTerminal() {
+  if (!terminal && stripeKey) terminal = new StripeTerminal(stripeKey);
+  return terminal;
+}
+
+// ─── SSE clients ─────────────────────────────────────────────────────────────
+
+const sseClients = new Set();
+
+PaymentStore.on('webhook', (entry) => {
+  const data = `event: webhook\ndata: ${JSON.stringify(entry)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(data); } catch (_) { sseClients.delete(res); }
+  }
+});
+
+// ─── WEBHOOK (debe ir antes de express.json para recibir raw body) ────────────
+
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const sig           = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const t             = getTerminal();
+
+  let event;
+  try {
+    if (webhookSecret && t) {
+      event = t.verifyWebhook(req.body, sig, webhookSecret);
+    } else {
+      if (!webhookSecret) Logger.warn('WEBHOOK', 'STRIPE_WEBHOOK_SECRET no configurado — omitiendo verificación de firma');
+      event = JSON.parse(req.body.toString());
+    }
+  } catch (err) {
+    Logger.error('WEBHOOK', `Firma inválida: ${err.message}`);
+    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+  }
+
+  handleWebhookEvent(event);
+  res.json({ received: true });
+});
+
+// ─── MIDDLEWARE GLOBAL ────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json());
@@ -15,20 +62,9 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use('/public', express.static(path.join(__dirname, 'views/public')));
 
-let terminal = null;
-let stripeKey = process.env.STRIPE_SECRET_KEY || '';
-
-function getTerminal() {
-  if (!terminal && stripeKey) {
-    terminal = new StripeTerminal(stripeKey);
-  }
-  return terminal;
-}
-
 // ─── UI ──────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  const t = getTerminal();
   res.render('kiosk', {
     stripeKey: stripeKey ? stripeKey.substring(0, 12) + '...' : '',
     keyConfigured: !!stripeKey,
@@ -48,7 +84,7 @@ app.post('/api/config/key', (req, res) => {
     return res.status(400).json({ status: 'error', message: 'Clave inválida. Debe empezar con sk_' });
   }
   stripeKey = key;
-  terminal = new StripeTerminal(stripeKey);
+  terminal  = new StripeTerminal(stripeKey);
   Logger.info('CONFIG', `Stripe key actualizada: ${key.substring(0, 12)}...`);
   res.json({ status: 'success', message: 'Clave configurada correctamente' });
 });
@@ -65,12 +101,8 @@ app.get('/api/status', async (req, res) => {
       status: 'success',
       keyConfigured: true,
       readers: readers.map(r => ({
-        id: r.id,
-        label: r.label,
-        serial: r.serial_number,
-        status: r.status,
-        deviceType: r.device_type,
-        location: r.location,
+        id: r.id, label: r.label, serial: r.serial_number,
+        status: r.status, deviceType: r.device_type, location: r.location,
       })),
     });
   } catch (e) {
@@ -92,7 +124,7 @@ app.get('/list_readers', async (req, res) => {
   }
 });
 
-// ─── CONNECTION TOKEN (para que el lector se conecte) ────────────────────────
+// ─── CONNECTION TOKEN ─────────────────────────────────────────────────────────
 
 app.post('/connection_token', async (req, res) => {
   const t = getTerminal();
@@ -108,14 +140,14 @@ app.post('/connection_token', async (req, res) => {
   }
 });
 
-// ─── PAGO PRINCIPAL (compatible con totem_kiosko) ────────────────────────────
+// ─── PAGO PRINCIPAL ───────────────────────────────────────────────────────────
 //
 //  GET /pago/:device/:type/:amount
 //    device : label o número de serie del lector
 //    type   : "ctl" | "chip" | "qr"
 //    amount : monto en formato decimal "100.50"
 //
-//  Respuesta idéntica al formato de red-enlace-api:
+//  Respuesta compatible con totem_kiosko:
 //  { status: "success", message: [ {name, value}, ... ] }
 
 app.get('/pago/:device/:type/:amount', async (req, res) => {
@@ -137,7 +169,6 @@ app.get('/pago/:device/:type/:amount', async (req, res) => {
     return res.json(buildErrorResponse('12', `Monto inválido: ${amount}`));
   }
 
-  // Stripe requiere mínimo $0.50
   if (amountCents < 50) {
     Logger.warn('PAGO', `Monto muy bajo: ${amount} (mínimo $0.50)`);
     return res.json(buildErrorResponse('12', `Monto mínimo es $0.50. Recibido: $${amount}`));
@@ -146,10 +177,10 @@ app.get('/pago/:device/:type/:amount', async (req, res) => {
   Logger.info('API_IN', `[PAGO] device=${device} type=${type} amount=${amount} (${amountCents} centavos)`);
 
   try {
-    // 1. Buscar el lector (resuelve alias de .env: DEVICE_device001=PRUEBA)
-    const aliasKey = `DEVICE_${device}`;
+    const aliasKey      = `DEVICE_${device}`;
     const resolvedDevice = process.env[aliasKey] || device;
-    const reader = await t.findReader(resolvedDevice);
+    const reader        = await t.findReader(resolvedDevice);
+
     if (!reader) {
       Logger.error('PAGO', `Lector no encontrado: ${device}`);
       return res.json(buildErrorResponse('96', `Lector no encontrado: ${device}`));
@@ -162,30 +193,36 @@ app.get('/pago/:device/:type/:amount', async (req, res) => {
 
     Logger.info('PAGO', `Lector encontrado: ${reader.id} (${reader.label || reader.serial_number})`);
 
-    // 2. Crear PaymentIntent
-    const currency = process.env.CURRENCY || 'usd';
+    const currency      = process.env.CURRENCY || 'usd';
     const paymentIntent = await t.createPaymentIntent(amountCents, currency, {
-      device,
-      type,
-      totem: process.env.TOTEM_ID || 'totem001',
+      device, type, totem: process.env.TOTEM_ID || 'totem001',
     });
     Logger.info('PAGO', `PaymentIntent creado: ${paymentIntent.id}`);
 
-    // 3. Enviar al lector
+    // Registrar en el store
+    PaymentStore.upsert(paymentIntent.id, {
+      device, type, amount, amountCents,
+      status: 'created',
+      readerId: reader.id,
+    });
+
     await t.processPaymentIntent(reader.id, paymentIntent.id);
     Logger.info('PAGO', `Procesando en lector ${reader.id}...`);
 
-    // 4. Esperar resultado (polling no-bloqueante)
+    PaymentStore.upsert(paymentIntent.id, { status: 'processing' });
+
     const result = await t.waitForPayment(paymentIntent.id, 60, reader.id);
 
     if (!result.success) {
       Logger.warn('API_OUT', `Pago fallido: ${result.message}`);
+      PaymentStore.upsert(paymentIntent.id, { status: 'failed', failReason: result.message });
       return res.json(buildErrorResponse(result.code || '05', result.message));
     }
 
-    // 5. Capturar
     const captured = await t.capturePaymentIntent(paymentIntent.id);
     Logger.info('PAGO', `PaymentIntent capturado: ${captured.id}`);
+
+    PaymentStore.upsert(paymentIntent.id, { status: 'captured' });
 
     const response = buildSuccessResponse(captured, reader, amountCents, type);
     Logger.info('API_OUT', `Pago aprobado: authCode=${captured.id} amount=${amount}`);
@@ -197,7 +234,7 @@ app.get('/pago/:device/:type/:amount', async (req, res) => {
   }
 });
 
-// ─── CANCELAR PAGO ───────────────────────────────────────────────────────────
+// ─── CANCELAR PAGO ────────────────────────────────────────────────────────────
 
 app.get('/cancelar/:paymentIntentId', async (req, res) => {
   const t = getTerminal();
@@ -206,6 +243,7 @@ app.get('/cancelar/:paymentIntentId', async (req, res) => {
   try {
     const cancelled = await t.cancelPaymentIntent(req.params.paymentIntentId);
     Logger.info('CANCELAR', `PaymentIntent cancelado: ${cancelled.id}`);
+    PaymentStore.upsert(cancelled.id, { status: 'canceled' });
     res.json({ status: 'success', paymentIntentId: cancelled.id });
   } catch (e) {
     Logger.error('CANCELAR', e.message);
@@ -213,7 +251,7 @@ app.get('/cancelar/:paymentIntentId', async (req, res) => {
   }
 });
 
-// ─── CANCELAR ACCIÓN EN LECTOR ───────────────────────────────────────────────
+// ─── CANCELAR ACCIÓN EN LECTOR ────────────────────────────────────────────────
 
 app.get('/cancelar_lector/:device', async (req, res) => {
   const t = getTerminal();
@@ -232,33 +270,163 @@ app.get('/cancelar_lector/:device', async (req, res) => {
   }
 });
 
-// ─── LOGS API ─────────────────────────────────────────────────────────────────
+// ─── REEMBOLSO ────────────────────────────────────────────────────────────────
+//
+//  POST /api/refund
+//  body: { paymentIntentId: "pi_...", amount?: "25.00" }   ← amount opcional
+//
+//  Reembolso total si no se especifica amount.
+
+app.post('/api/refund', async (req, res) => {
+  const t = getTerminal();
+  if (!t) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  const { paymentIntentId, amount } = req.body;
+  if (!paymentIntentId) {
+    return res.status(400).json({ status: 'error', message: 'paymentIntentId es requerido' });
+  }
+
+  let amountCents = null;
+  if (amount != null) {
+    amountCents = Math.round(parseFloat(amount) * 100);
+    if (isNaN(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ status: 'error', message: `Monto inválido: ${amount}` });
+    }
+  }
+
+  try {
+    const refund = await t.createRefund(paymentIntentId, amountCents);
+    Logger.info('REFUND', `Reembolso creado: ${refund.id} PI=${paymentIntentId} amount=${refund.amount}`);
+    PaymentStore.upsert(paymentIntentId, {
+      refunded: true,
+      refundId: refund.id,
+      amountRefunded: refund.amount,
+    });
+    res.json({
+      status:  'success',
+      refundId: refund.id,
+      amount:   (refund.amount / 100).toFixed(2),
+      currency: refund.currency,
+      piStatus: refund.status,
+    });
+  } catch (e) {
+    Logger.error('REFUND', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+// ─── PAYMENT STORE ────────────────────────────────────────────────────────────
+
+app.get('/api/payments', (req, res) => {
+  const n = parseInt(req.query.limit) || 50;
+  res.json({ status: 'success', payments: PaymentStore.getRecent(n) });
+});
+
+app.get('/api/payments/:id', (req, res) => {
+  const payment = PaymentStore.get(req.params.id);
+  if (!payment) return res.status(404).json({ status: 'error', message: 'No encontrado' });
+  res.json({ status: 'success', payment });
+});
+
+// ─── WEBHOOK EVENTS ───────────────────────────────────────────────────────────
+
+app.get('/api/webhook-events', (req, res) => {
+  const n = parseInt(req.query.limit) || 100;
+  res.json({ status: 'success', events: PaymentStore.getRecentWebhookEvents(n) });
+});
+
+// ─── SSE STREAM (para monitor en tiempo real) ─────────────────────────────────
+
+app.get('/api/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  res.write('event: ping\ndata: connected\n\n');
+  sseClients.add(res);
+
+  req.on('close', () => sseClients.delete(res));
+});
+
+// ─── LOGS ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/logs', (req, res) => {
   const lines = parseInt(req.query.lines) || 100;
   res.json({ status: 'success', logs: Logger.getRecentLogs(lines) });
 });
 
+// ─── WEBHOOK HANDLER ─────────────────────────────────────────────────────────
+
+function handleWebhookEvent(event) {
+  const obj = event.data?.object || {};
+
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      Logger.info('WEBHOOK', `payment_intent.succeeded: ${obj.id} amount=${obj.amount}`);
+      PaymentStore.upsert(obj.id, {
+        status: 'succeeded', webhookConfirmed: true,
+        amount: obj.amount, currency: obj.currency,
+      });
+      break;
+
+    case 'payment_intent.requires_capture':
+      Logger.info('WEBHOOK', `payment_intent.requires_capture: ${obj.id}`);
+      PaymentStore.upsert(obj.id, { status: 'requires_capture' });
+      break;
+
+    case 'payment_intent.payment_failed': {
+      const err = obj.last_payment_error;
+      Logger.warn('WEBHOOK', `payment_intent.payment_failed: ${obj.id} — ${err?.message}`);
+      PaymentStore.upsert(obj.id, {
+        status: 'failed', webhookConfirmed: true,
+        error: err?.message, declineCode: err?.decline_code,
+      });
+      break;
+    }
+
+    case 'payment_intent.canceled':
+      Logger.info('WEBHOOK', `payment_intent.canceled: ${obj.id}`);
+      PaymentStore.upsert(obj.id, { status: 'canceled', webhookConfirmed: true });
+      break;
+
+    case 'charge.refunded':
+      Logger.info('WEBHOOK', `charge.refunded: ${obj.id} refunded=${obj.amount_refunded}`);
+      if (obj.payment_intent) {
+        PaymentStore.upsert(obj.payment_intent, {
+          refunded: true, amountRefunded: obj.amount_refunded,
+        });
+      }
+      break;
+
+    case 'terminal.reader.action_succeeded':
+      Logger.info('WEBHOOK', `terminal.reader.action_succeeded: reader=${obj.id}`);
+      break;
+
+    case 'terminal.reader.action_failed':
+      Logger.warn('WEBHOOK', `terminal.reader.action_failed: reader=${obj.id} — ${obj.action?.failure_message}`);
+      break;
+
+    default:
+      Logger.debug('WEBHOOK', `Evento recibido (no manejado): ${event.type}`);
+  }
+
+  PaymentStore.addWebhookEvent(event);
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function buildSuccessResponse(captured, reader, amountCents, type) {
-  const pm = captured.payment_method_details;
+  const pm   = captured.payment_method_details;
   const card = pm?.card_present || pm?.interac_present || {};
-  const now = new Date();
+  const now  = new Date();
 
-  // Formato que espera el tótem: "YYYY-MM-DD" y "HH:MM:SS"
-  const year  = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day   = String(now.getDate()).padStart(2, '0');
-  const hours   = String(now.getHours()).padStart(2, '0');
-  const minutes = String(now.getMinutes()).padStart(2, '0');
-  const seconds = String(now.getSeconds()).padStart(2, '0');
+  const pad = n => String(n).padStart(2, '0');
+  const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 
-  // purchaseAmount en decimal "25.00" (como envía el tótem y espera de vuelta)
   const amountFormatted = (amountCents / 100).toFixed(2);
   const authCode = card.authorization_code || captured.id.slice(-6).toUpperCase();
-  const last4 = card.last4 || '0000';
-  const brand = card.brand || '';
 
   const paymentMethodNames = { ctl: 'Tarjeta NFC', chip: 'Tarjeta Chip', qr: 'QR' };
 
@@ -271,10 +439,10 @@ function buildSuccessResponse(captured, reader, amountCents, type) {
       { name: 'receiptNumber',   value: captured.id.slice(-6).toUpperCase() },
       { name: 'RRN',             value: captured.id },
       { name: 'terminalID',      value: reader.id },
-      { name: 'transactionDate', value: `${year}-${month}-${day}` },
-      { name: 'transactionTime', value: `${hours}:${minutes}:${seconds}` },
-      { name: 'last4Digits',     value: last4 },
-      { name: 'cardBINTarjeta',  value: brand },
+      { name: 'transactionDate', value: date },
+      { name: 'transactionTime', value: time },
+      { name: 'last4Digits',     value: card.last4 || '0000' },
+      { name: 'cardBINTarjeta',  value: card.brand || '' },
       { name: 'paymentMethod',   value: paymentMethodNames[type] || 'Tarjeta' },
       { name: 'errorMessage',    value: '' },
       { name: 'paymentIntentId', value: captured.id },
@@ -306,7 +474,7 @@ function buildErrorResponse(code, message) {
   };
 }
 
-// ─── START ───────────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   Logger.info('SERVER', `Stripe Terminal API corriendo en http://localhost:${PORT}`);
@@ -314,5 +482,8 @@ app.listen(PORT, () => {
     Logger.warn('SERVER', 'STRIPE_SECRET_KEY no configurada. Ve a http://localhost:' + PORT + ' para configurar.');
   } else {
     Logger.info('SERVER', `Stripe key cargada: ${stripeKey.substring(0, 12)}...`);
+  }
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
+    Logger.warn('SERVER', 'STRIPE_WEBHOOK_SECRET no configurado — los webhooks no verificarán firma.');
   }
 });

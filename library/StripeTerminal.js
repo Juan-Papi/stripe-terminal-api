@@ -6,13 +6,19 @@ class StripeTerminal {
     this.stripe = Stripe(secretKey, { apiVersion: '2024-06-20' });
   }
 
-  // ─── Connection Token ───────────────────────────────────────────────────────
+  // ─── Webhook ─────────────────────────────────────────────────────────────────
+
+  verifyWebhook(rawBody, signature, secret) {
+    return this.stripe.webhooks.constructEvent(rawBody, signature, secret);
+  }
+
+  // ─── Connection Token ─────────────────────────────────────────────────────
 
   async createConnectionToken() {
     return this.stripe.terminal.connectionTokens.create();
   }
 
-  // ─── Readers ────────────────────────────────────────────────────────────────
+  // ─── Readers ──────────────────────────────────────────────────────────────
 
   async listReaders() {
     const result = await this.stripe.terminal.readers.list({ limit: 100 });
@@ -20,8 +26,7 @@ class StripeTerminal {
   }
 
   /**
-   * Busca un lector por label, número de serie o ID de Stripe.
-   * Coincidencia case-insensitive.
+   * Busca un lector por label, número de serie o ID de Stripe (case-insensitive).
    */
   async findReader(deviceIdentifier) {
     const readers = await this.listReaders();
@@ -38,7 +43,7 @@ class StripeTerminal {
     return this.stripe.terminal.readers.cancelAction(readerId);
   }
 
-  // ─── Payment Intent ──────────────────────────────────────────────────────────
+  // ─── Payment Intent ───────────────────────────────────────────────────────
 
   async createPaymentIntent(amountCents, currency, metadata = {}) {
     return this.stripe.paymentIntents.create({
@@ -52,14 +57,11 @@ class StripeTerminal {
 
   async capturePaymentIntent(paymentIntentId) {
     const pi = await this.stripe.paymentIntents.capture(paymentIntentId);
-    // Expandir charges para obtener detalles de la tarjeta
     const charge = pi.latest_charge
       ? await this.stripe.charges.retrieve(pi.latest_charge)
       : null;
 
-    if (charge) {
-      pi.payment_method_details = charge.payment_method_details;
-    }
+    if (charge) pi.payment_method_details = charge.payment_method_details;
     return pi;
   }
 
@@ -71,22 +73,32 @@ class StripeTerminal {
     return this.stripe.paymentIntents.retrieve(paymentIntentId);
   }
 
-  // ─── Process on Reader ───────────────────────────────────────────────────────
+  // ─── Refunds ──────────────────────────────────────────────────────────────
 
   /**
-   * Envía el PaymentIntent al lector físico para que el cliente pague.
+   * Reembolsa un PaymentIntent completo o parcialmente.
+   * @param {string} paymentIntentId
+   * @param {number|null} amountCents  null = reembolso total
    */
+  async createRefund(paymentIntentId, amountCents = null) {
+    const params = { payment_intent: paymentIntentId };
+    if (amountCents != null) params.amount = amountCents;
+    return this.stripe.refunds.create(params);
+  }
+
+  // ─── Process on Reader ────────────────────────────────────────────────────
+
   async processPaymentIntent(readerId, paymentIntentId) {
     return this.stripe.terminal.readers.processPaymentIntent(readerId, {
       payment_intent: paymentIntentId,
     });
   }
 
-  // ─── Polling ─────────────────────────────────────────────────────────────────
+  // ─── Polling ──────────────────────────────────────────────────────────────
 
   /**
    * Espera hasta timeoutSeconds a que el PaymentIntent sea requires_capture o
-   * failed/cancelled. No bloquea el servidor (Node.js event loop).
+   * failed/cancelled. No bloquea el event loop.
    *
    * Retorna: { success: bool, code: string, message: string }
    */
@@ -102,8 +114,6 @@ class StripeTerminal {
 
       switch (pi.status) {
         case 'requires_capture':
-          return { success: true };
-
         case 'succeeded':
           return { success: true };
 
@@ -112,35 +122,28 @@ class StripeTerminal {
 
         case 'payment_failed': {
           const err = pi.last_payment_error;
-          const code = err?.decline_code || err?.code || '05';
           return {
             success: false,
-            code: this._mapDeclineCode(code),
+            code: this._mapDeclineCode(err?.decline_code || err?.code || '05'),
             message: err?.message || 'PAGO RECHAZADO',
           };
         }
 
         case 'requires_payment_method':
-          // Estado inicial del PI antes de que el lector interactúe,
-          // o después de que el cliente cancela en el lector.
-          // Solo es fallo real si hay un error registrado.
           if (pi.last_payment_error) {
             const err = pi.last_payment_error;
-            const code = err?.decline_code || err?.code || '05';
             return {
               success: false,
-              code: this._mapDeclineCode(code),
+              code: this._mapDeclineCode(err?.decline_code || err?.code || '05'),
               message: err?.message || 'PAGO RECHAZADO',
             };
           }
-          break; // Sin error → seguir esperando
+          break;
 
-        // requires_action, requires_confirmation, processing → seguir esperando
         default:
           break;
       }
 
-      // Revisar el reader action desde el PI (disponible en expand o metadata)
       if (attempt > 2 && pi.last_payment_error) {
         const err = pi.last_payment_error;
         return {
@@ -150,12 +153,9 @@ class StripeTerminal {
         };
       }
 
-      // Revisar si el lector canceló la acción (solo si tenemos el readerId)
-      if (attempt > 5) {
+      if (attempt > 5 && readerId) {
         try {
-          const rid = readerId || await this._getReaderFromPi(paymentIntentId);
-          if (!rid) break;
-          const reader = await this.stripe.terminal.readers.retrieve(rid);
+          const reader = await this.stripe.terminal.readers.retrieve(readerId);
           if (reader.action?.status === 'failed') {
             return {
               success: false,
@@ -170,26 +170,21 @@ class StripeTerminal {
     return { success: false, code: '91', message: 'TIMEOUT: El lector no respondió a tiempo' };
   }
 
-  // ─── Helpers privados ────────────────────────────────────────────────────────
+  // ─── Helpers privados ─────────────────────────────────────────────────────
 
   _mapDeclineCode(code) {
     const map = {
-      insufficient_funds: '51',
-      lost_card: '41',
-      stolen_card: '43',
-      expired_card: '33',
-      incorrect_pin: '55',
-      invalid_account: '14',
-      card_velocity_exceeded: '61',
-      do_not_honor: '05',
-      fraudulent: '59',
+      insufficient_funds:      '51',
+      lost_card:               '41',
+      stolen_card:             '43',
+      expired_card:            '33',
+      incorrect_pin:           '55',
+      invalid_account:         '14',
+      card_velocity_exceeded:  '61',
+      do_not_honor:            '05',
+      fraudulent:              '59',
     };
     return map[code] || '05';
-  }
-
-  async _getReaderFromPi(paymentIntentId) {
-    // No hay un endpoint directo; devolvemos null y el caller lo ignora
-    return null;
   }
 }
 
