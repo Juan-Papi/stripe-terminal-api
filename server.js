@@ -4,6 +4,7 @@ const cors    = require('cors');
 const path    = require('path');
 
 const StripeTerminal = require('./library/StripeTerminal');
+const StripeConnect  = require('./library/StripeConnect');
 const Logger         = require('./library/Logger');
 const PaymentStore   = require('./library/PaymentStore');
 
@@ -11,11 +12,17 @@ const app  = express();
 const PORT = process.env.PORT || 8001;
 
 let terminal = null;
+let connect  = null;
 let stripeKey = process.env.STRIPE_SECRET_KEY || '';
 
 function getTerminal() {
   if (!terminal && stripeKey) terminal = new StripeTerminal(stripeKey);
   return terminal;
+}
+
+function getConnect() {
+  if (!connect && stripeKey) connect = new StripeConnect(stripeKey);
+  return connect;
 }
 
 // ─── SSE clients ─────────────────────────────────────────────────────────────
@@ -85,6 +92,7 @@ app.post('/api/config/key', (req, res) => {
   }
   stripeKey = key;
   terminal  = new StripeTerminal(stripeKey);
+  connect   = new StripeConnect(stripeKey);
   Logger.info('CONFIG', `Stripe key actualizada: ${key.substring(0, 12)}...`);
   res.json({ status: 'success', message: 'Clave configurada correctamente' });
 });
@@ -193,10 +201,22 @@ app.get('/pago/:device/:type/:amount', async (req, res) => {
 
     Logger.info('PAGO', `Lector encontrado: ${reader.id} (${reader.label || reader.serial_number})`);
 
-    const currency      = process.env.CURRENCY || 'usd';
-    const paymentIntent = await t.createPaymentIntent(amountCents, currency, {
-      device, type, totem: process.env.TOTEM_ID || 'totem001',
-    });
+    const currency = process.env.CURRENCY || 'usd';
+    const merchantId = req.query.merchant || null;
+    let applicationFeeAmount = null;
+    if (req.query.fee != null) {
+      applicationFeeAmount = Math.round(parseFloat(req.query.fee) * 100);
+      if (isNaN(applicationFeeAmount) || applicationFeeAmount < 0) applicationFeeAmount = null;
+    }
+
+    const connectOptions = merchantId ? { merchantId, applicationFeeAmount } : null;
+
+    const paymentIntent = await t.createPaymentIntent(
+      amountCents,
+      currency,
+      { device, type, totem: process.env.TOTEM_ID || 'totem001', ...(merchantId && { merchant: merchantId }) },
+      connectOptions,
+    );
     Logger.info('PAGO', `PaymentIntent creado: ${paymentIntent.id}`);
 
     // Registrar en el store
@@ -315,6 +335,130 @@ app.post('/api/refund', async (req, res) => {
   }
 });
 
+// ─── STRIPE CONNECT ───────────────────────────────────────────────────────────
+//
+//  POST /api/connect/account
+//  body: { email, country?, businessName? }
+//  → Crea una cuenta Express para el comercio y retorna su ID (acct_xxx)
+//
+//  POST /api/connect/account-link
+//  body: { accountId, refreshUrl, returnUrl }
+//  → Genera la URL de onboarding para que el comercio complete sus datos
+//
+//  GET  /api/connect/accounts
+//  → Lista todas las cuentas conectadas
+//
+//  GET  /api/connect/account/:accountId
+//  → Detalles y estado de una cuenta (charges_enabled, payouts_enabled, etc.)
+//
+//  DELETE /api/connect/account/:accountId
+//  → Elimina una cuenta (solo funciona en modo test)
+
+app.post('/api/connect/account', async (req, res) => {
+  const c = getConnect();
+  if (!c) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  const { email, country, businessName } = req.body;
+  if (!email) return res.status(400).json({ status: 'error', message: 'email es requerido' });
+
+  try {
+    const account = await c.createAccount(email, country || 'US', businessName || null);
+    res.json({
+      status:    'success',
+      accountId: account.id,
+      email:     account.email,
+      country:   account.country,
+      chargesEnabled: account.charges_enabled,
+      payoutsEnabled: account.payouts_enabled,
+    });
+  } catch (e) {
+    Logger.error('CONNECT', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+app.post('/api/connect/account-link', async (req, res) => {
+  const c = getConnect();
+  if (!c) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  const { accountId, refreshUrl, returnUrl } = req.body;
+  if (!accountId) return res.status(400).json({ status: 'error', message: 'accountId es requerido' });
+
+  const baseUrl = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
+  const finalRefreshUrl = refreshUrl || `${baseUrl}/connect/refresh?account=${accountId}`;
+  const finalReturnUrl  = returnUrl  || `${baseUrl}/connect/return?account=${accountId}`;
+
+  try {
+    const link = await c.createAccountLink(accountId, finalRefreshUrl, finalReturnUrl);
+    res.json({ status: 'success', url: link.url, expiresAt: link.expires_at });
+  } catch (e) {
+    Logger.error('CONNECT', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+app.get('/api/connect/accounts', async (req, res) => {
+  const c = getConnect();
+  if (!c) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  try {
+    const accounts = await c.listAccounts();
+    res.json({
+      status: 'success',
+      accounts: accounts.map(a => ({
+        id:             a.id,
+        email:          a.email,
+        country:        a.country,
+        businessName:   a.business_profile?.name || null,
+        chargesEnabled: a.charges_enabled,
+        payoutsEnabled: a.payouts_enabled,
+        detailsSubmitted: a.details_submitted,
+      })),
+    });
+  } catch (e) {
+    Logger.error('CONNECT', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+app.get('/api/connect/account/:accountId', async (req, res) => {
+  const c = getConnect();
+  if (!c) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  try {
+    const a = await c.getAccount(req.params.accountId);
+    res.json({
+      status: 'success',
+      account: {
+        id:               a.id,
+        email:            a.email,
+        country:          a.country,
+        businessName:     a.business_profile?.name || null,
+        chargesEnabled:   a.charges_enabled,
+        payoutsEnabled:   a.payouts_enabled,
+        detailsSubmitted: a.details_submitted,
+        requirements:     a.requirements,
+      },
+    });
+  } catch (e) {
+    Logger.error('CONNECT', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+app.delete('/api/connect/account/:accountId', async (req, res) => {
+  const c = getConnect();
+  if (!c) return res.status(503).json({ status: 'error', message: 'Stripe key no configurada' });
+
+  try {
+    const result = await c.deleteAccount(req.params.accountId);
+    res.json({ status: 'success', deleted: result.deleted, id: result.id });
+  } catch (e) {
+    Logger.error('CONNECT', e.message);
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
 // ─── PAYMENT STORE ────────────────────────────────────────────────────────────
 
 app.get('/api/payments', (req, res) => {
@@ -405,6 +549,16 @@ function handleWebhookEvent(event) {
 
     case 'terminal.reader.action_failed':
       Logger.warn('WEBHOOK', `terminal.reader.action_failed: reader=${obj.id} — ${obj.action?.failure_message}`);
+      break;
+
+    case 'account.updated': {
+      const enabled = obj.charges_enabled ? 'habilitado' : 'pendiente';
+      Logger.info('WEBHOOK', `account.updated: ${obj.id} charges=${enabled}`);
+      break;
+    }
+
+    case 'account.application.deauthorized':
+      Logger.warn('WEBHOOK', `account.application.deauthorized: ${obj.id}`);
       break;
 
     default:

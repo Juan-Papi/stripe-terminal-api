@@ -45,14 +45,26 @@ class StripeTerminal {
 
   // ─── Payment Intent ───────────────────────────────────────────────────────
 
-  async createPaymentIntent(amountCents, currency, metadata = {}) {
-    return this.stripe.paymentIntents.create({
+  /**
+   * @param {object|null} connectOptions  { merchantId: 'acct_xxx', applicationFeeAmount?: number }
+   */
+  async createPaymentIntent(amountCents, currency, metadata = {}, connectOptions = null) {
+    const params = {
       amount: amountCents,
       currency,
       payment_method_types: ['card_present'],
       capture_method: 'manual',
       metadata,
-    });
+    };
+
+    if (connectOptions?.merchantId) {
+      params.transfer_data = { destination: connectOptions.merchantId };
+      if (connectOptions.applicationFeeAmount != null) {
+        params.application_fee_amount = connectOptions.applicationFeeAmount;
+      }
+    }
+
+    return this.stripe.paymentIntents.create(params);
   }
 
   async capturePaymentIntent(paymentIntentId) {
